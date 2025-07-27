@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "scan.h": "c",
+        "types.h": "c",
+        "ras.h": "c",
+        "gatt.h": "c"
+    }
+}
