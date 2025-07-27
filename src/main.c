@@ -45,6 +45,7 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 
 static struct bt_uuid_128 custom_service_uuid = BT_UUID_INIT_128(BT_UUID_CUSTOM_SERVICE_VAL);
 static struct bt_uuid_128 custom_char_uuid = BT_UUID_INIT_128(BT_UUID_CUSTOM_CHAR_VAL);
+static struct bt_gatt_subscribe_params subscribe_params;
 static K_SEM_DEFINE(sem_remote_capabilities_obtained, 0, 1);
 static K_SEM_DEFINE(sem_config_created, 0, 1);
 static K_SEM_DEFINE(sem_cs_security_enabled, 0, 1);
@@ -481,7 +482,7 @@ BT_CONN_CB_DEFINE(conn_cb) = {
 	.le_cs_subevent_data_available = subevent_result_cb,
 };
 
-static void read_hello_char_cb(struct bt_conn *conn, uint8_t err,
+static uint8_t  read_hello_char_cb(struct bt_conn *conn, uint8_t err,
                                struct bt_gatt_read_params *params,
                                const void *data, uint16_t length)
 {
@@ -535,6 +536,19 @@ static struct bt_gatt_dm_cb custom_service_discovery_cb = {
 	.service_not_found = discovery_service_not_found_cb,
 	.error_found = discovery_error_found_cb,
 };
+
+static uint8_t hello_notify_cb(struct bt_conn *conn,
+                               struct bt_gatt_subscribe_params *params,
+                               const void *data, uint16_t length)
+{
+    if (!data) {
+        LOG_INF("Notification disabled");
+        return BT_GATT_ITER_STOP;
+    }
+
+    LOG_INF("🔔 Notification received: %.*s", length, (const char *)data);
+    return BT_GATT_ITER_CONTINUE;
+}
 
 int main(void)
 {
@@ -590,6 +604,18 @@ int main(void)
 		return 0;
 	}
 	k_sem_take(&sem_custom_service_discovered, K_FOREVER);
+	subscribe_params.ccc_handle = hello_char_handle + 1; // usually CCCD is next handle
+	subscribe_params.value_handle = hello_char_handle;
+	subscribe_params.notify = hello_notify_cb;
+	subscribe_params.value = BT_GATT_CCC_NOTIFY;
+	
+
+	err = bt_gatt_subscribe(connection, &subscribe_params);
+	if (err) {
+		LOG_ERR("Failed to subscribe to notifications (err %d)", err);
+	} else {
+		LOG_INF("✅ Subscribed to notifications");
+	}
 
 	// Set correct handle
 	read_params.single.handle = hello_char_handle;
