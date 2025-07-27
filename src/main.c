@@ -19,6 +19,9 @@
 #include <bluetooth/services/ras.h>
 #include <bluetooth/gatt_dm.h>
 #include <bluetooth/cs_de.h>
+#include <zephyr/bluetooth/hci.h>
+#include <zephyr/bluetooth/gatt.h>
+#include <zephyr/bluetooth/uuid.h>
 
 #include <dk_buttons_and_leds.h>
 
@@ -37,6 +40,11 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 	((BT_RAS_MAX_STEPS_PER_PROCEDURE * sizeof(struct bt_le_cs_subevent_step)) +                \
 	 (BT_RAS_MAX_STEPS_PER_PROCEDURE * BT_RAS_MAX_STEP_DATA_LEN))
 
+#define BT_UUID_CUSTOM_SERVICE_VAL   BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x1234, 0x1234, 0x123456789abc)
+#define BT_UUID_CUSTOM_CHAR_VAL      BT_UUID_128_ENCODE(0xabcdef01, 0x2345, 0x3456, 0x4567, 0x56789abcdef0)
+
+static struct bt_uuid_128 custom_service_uuid = BT_UUID_INIT_128(BT_UUID_CUSTOM_SERVICE_VAL);
+static struct bt_uuid_128 custom_char_uuid = BT_UUID_INIT_128(BT_UUID_CUSTOM_CHAR_VAL);
 static K_SEM_DEFINE(sem_remote_capabilities_obtained, 0, 1);
 static K_SEM_DEFINE(sem_config_created, 0, 1);
 static K_SEM_DEFINE(sem_cs_security_enabled, 0, 1);
@@ -45,6 +53,7 @@ static K_SEM_DEFINE(sem_discovery_done, 0, 1);
 static K_SEM_DEFINE(sem_mtu_exchange_done, 0, 1);
 static K_SEM_DEFINE(sem_security, 0, 1);
 static K_SEM_DEFINE(sem_local_steps, 1, 1);
+K_SEM_DEFINE(sem_custom_service_discovered, 0, 1);
 
 static K_MUTEX_DEFINE(distance_estimate_buffer_mutex);
 
@@ -57,6 +66,7 @@ static int32_t dropped_ranging_counter = PROCEDURE_COUNTER_NONE;
 static uint8_t buffer_index;
 static uint8_t buffer_num_valid;
 static cs_de_dist_estimates_t distance_estimate_buffer[MAX_AP][DE_SLIDING_WINDOW_SIZE];
+
 
 static void store_distance_estimates(cs_de_report_t *p_report)
 {
@@ -471,6 +481,61 @@ BT_CONN_CB_DEFINE(conn_cb) = {
 	.le_cs_subevent_data_available = subevent_result_cb,
 };
 
+static void read_hello_char_cb(struct bt_conn *conn, uint8_t err,
+                               struct bt_gatt_read_params *params,
+                               const void *data, uint16_t length)
+{
+	if (err) {
+		LOG_ERR("Failed to read characteristic (err 0x%02x)", err);
+	} else if (data) {
+		LOG_INF("✅ Read value: %.*s", length, (const char *)data);
+	} else {
+		LOG_WRN("No data received in read callback");
+	}
+}
+
+static struct bt_gatt_read_params read_params = {
+	.func = read_hello_char_cb,
+	.handle_count = 1,
+	.single = {
+		.handle = 0,  // Will be filled in later
+		.offset = 0,
+	},
+};
+
+
+static uint16_t hello_char_handle;
+
+static void custom_service_discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
+{
+	LOG_INF("✅ Custom service discovered!");
+
+	const struct bt_gatt_dm_attr *chrc = bt_gatt_dm_char_by_uuid(dm, BT_UUID_DECLARE_128(BT_UUID_CUSTOM_CHAR_VAL));
+	if (!chrc) {
+		LOG_ERR("Custom char not found");
+		goto release;
+	}
+	
+	const struct bt_gatt_dm_attr *gatt_desc = bt_gatt_dm_desc_by_uuid(dm, chrc, BT_UUID_DECLARE_128(BT_UUID_CUSTOM_CHAR_VAL));
+	if (!gatt_desc) {
+		LOG_ERR("Char value descriptor not found");
+		goto release;
+	}
+	
+	hello_char_handle = gatt_desc->handle;
+	LOG_INF("🔑 Got HelloBLE char handle: 0x%04X", hello_char_handle);
+	
+	release:
+	bt_gatt_dm_data_release(dm);
+	k_sem_give(&sem_custom_service_discovered);  // Add this
+}
+
+static struct bt_gatt_dm_cb custom_service_discovery_cb = {
+	.completed = custom_service_discovery_completed_cb,
+	.service_not_found = discovery_service_not_found_cb,
+	.error_found = discovery_error_found_cb,
+};
+
 int main(void)
 {
 	int err;
@@ -518,8 +583,27 @@ int main(void)
 		LOG_ERR("Discovery failed (err %d)", err);
 		return 0;
 	}
-
 	k_sem_take(&sem_discovery_done, K_FOREVER);
+	err = bt_gatt_dm_start(connection, &custom_service_uuid.uuid, &custom_service_discovery_cb, NULL);
+	if (err) {
+		LOG_ERR("Custom service discovery failed (err %d)", err);
+		return 0;
+	}
+	k_sem_take(&sem_custom_service_discovered, K_FOREVER);
+
+	// Set correct handle
+	read_params.single.handle = hello_char_handle;
+
+	err = bt_gatt_read(connection, &read_params);
+	if (err) {
+		LOG_ERR("GATT read failed (err %d)", err);
+	}
+	// static struct bt_gatt_read_params read_params = {0};
+
+	// read_params.func = read_hello_char_cb;
+	// read_params.handle_count = 1;
+	// read_params.single.handle = 0;  // to be set later
+	// read_params.single.offset = 0;
 
 	const struct bt_le_cs_set_default_settings_param default_settings = {
 		.enable_initiator_role = true,

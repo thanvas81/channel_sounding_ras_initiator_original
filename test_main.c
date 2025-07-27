@@ -11,9 +11,6 @@
 #include <math.h>
 #include <zephyr/kernel.h>
 #include <zephyr/types.h>
-#include <zephyr/sys/printk.h>
-#include <zephyr/bluetooth/bluetooth.h>
-#include <zephyr/bluetooth/hci.h>
 #include <zephyr/sys/reboot.h>
 #include <zephyr/bluetooth/cs.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -22,7 +19,6 @@
 #include <bluetooth/services/ras.h>
 #include <bluetooth/gatt_dm.h>
 #include <bluetooth/cs_de.h>
-
 
 #include <dk_buttons_and_leds.h>
 
@@ -40,8 +36,6 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 #define LOCAL_PROCEDURE_MEM                                                                        \
 	((BT_RAS_MAX_STEPS_PER_PROCEDURE * sizeof(struct bt_le_cs_subevent_step)) +                \
 	 (BT_RAS_MAX_STEPS_PER_PROCEDURE * BT_RAS_MAX_STEP_DATA_LEN))
-
-#define MAX_PAYLOAD_LEN 29
 
 static K_SEM_DEFINE(sem_remote_capabilities_obtained, 0, 1);
 static K_SEM_DEFINE(sem_config_created, 0, 1);
@@ -63,44 +57,6 @@ static int32_t dropped_ranging_counter = PROCEDURE_COUNTER_NONE;
 static uint8_t buffer_index;
 static uint8_t buffer_num_valid;
 static cs_de_dist_estimates_t distance_estimate_buffer[MAX_AP][DE_SLIDING_WINDOW_SIZE];
-
-static struct bt_le_scan_param scan_params = {
-        .type     = BT_LE_SCAN_TYPE_PASSIVE,
-        .options  = BT_LE_SCAN_OPT_NONE,
-        .interval = BT_GAP_SCAN_FAST_INTERVAL,
-        .window   = BT_GAP_SCAN_FAST_WINDOW,
-    };
-
-static bool ad_parse(struct bt_data *data, void *user_data)
-{
-    char *name = user_data;
-
-    if (data->type == BT_DATA_NAME_COMPLETE) {
-        size_t len = MIN(data->data_len, MAX_PAYLOAD_LEN);
-        memcpy(name, data->data, len);
-        name[len] = '\0';
-    }
-    return true;  /* keep parsing */
-}
-
-static void scan_cb_adv(const struct bt_le_scan_recv_info *info,
-                        struct net_buf_simple       *buf)
-{
-    if (info->adv_type == BT_HCI_ADV_SCAN_RSP) {
-        return;
-    }
-
-    /* parse the “Complete Local Name” AD field */
-    char name[MAX_PAYLOAD_LEN + 1] = { 0 };
-    bt_data_parse(buf, ad_parse, name);
-    if (name[0]) {
-        printk("→ Received payload: %s (RSSI %d dBm)\n",
-               name, info->rssi);
-    }
-
-    /* hand off to the filtered‑connect logic */
-    bt_scan_on_scan_recv(info, buf);
-}
 
 static void store_distance_estimates(cs_de_report_t *p_report)
 {
@@ -482,16 +438,11 @@ static int scan_init(void)
 {
 	int err;
 
-	struct bt_scan_init_param scan_init_param = {
-	.scan_param = &scan_params,
-	.conn_param = BT_LE_CONN_PARAM_DEFAULT,
-	.connect_if_match = 1,
-	};
-	bt_scan_init(&scan_init_param);
-	bt_scan_cb_register(&scan_cb); 
+	struct bt_scan_init_param param = {
+		.scan_param = NULL, .conn_param = BT_LE_CONN_PARAM_DEFAULT, .connect_if_match = 1};
 
-	// bt_scan_init(&param);
-	// bt_scan_cb_register(&scan_cb);
+	bt_scan_init(&param);
+	bt_scan_cb_register(&scan_cb);
 
 	err = bt_scan_filter_add(BT_SCAN_FILTER_TYPE_UUID, BT_UUID_RANGING_SERVICE);
 	if (err) {
@@ -520,28 +471,31 @@ BT_CONN_CB_DEFINE(conn_cb) = {
 	.le_cs_subevent_data_available = subevent_result_cb,
 };
 
-void cs_initiator_thread(void *unused1, void *unused2, void *unused3)
+int main(void)
 {
-    ARG_UNUSED(unused1);
-    ARG_UNUSED(unused2);
-    ARG_UNUSED(unused3);
-
-    int err;
+	int err;
 
 	LOG_INF("Starting Channel Sounding Initiator Sample");
 
+	dk_leds_init();
 
-	// err = scan_init();
-	// if (err) {
-	// 	LOG_ERR("Scan init failed (err %d)", err);
-	// 	return 0;
-	// }
+	err = bt_enable(NULL);
+	if (err) {
+		LOG_ERR("Bluetooth init failed (err %d)", err);
+		return 0;
+	}
 
-	// err = bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE);
-	// if (err) {
-	// 	LOG_ERR("Scanning failed to start (err %i)", err);
-	// 	return 0;
-	// }
+	err = scan_init();
+	if (err) {
+		LOG_ERR("Scan init failed (err %d)", err);
+		return 0;
+	}
+
+	err = bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE);
+	if (err) {
+		LOG_ERR("Scanning failed to start (err %i)", err);
+		return 0;
+	}
 
 	k_sem_take(&sem_connected, K_FOREVER);
 
@@ -700,107 +654,4 @@ void cs_initiator_thread(void *unused1, void *unused2, void *unused3)
 	}
 
 	return 0;
-}
-
-void cl_receiver_thread(void *unused1, void *unused2, void *unused3)
-{
-	LOG_INF("Starting GATT Central");
-    ARG_UNUSED(unused1);
-    ARG_UNUSED(unused2);
-    ARG_UNUSED(unused3);
-
-    int err;
-
-    printk("Starting connection‑less receiver\n");
-
-    // err = bt_enable(NULL);
-    // if (err) {
-    //     printk("bt_enable() failed: %d\n", err);
-    //     return;
-    // }
-
-    // static struct bt_le_scan_param scan_params = {
-    //     .type     = BT_LE_SCAN_TYPE_PASSIVE,
-    //     .options  = BT_LE_SCAN_OPT_NONE,
-    //     .interval = BT_GAP_SCAN_FAST_INTERVAL,
-    //     .window   = BT_GAP_SCAN_FAST_WINDOW,
-    // };
-
-    // err = bt_le_scan_start(&scan_params, scan_cb_adv);
-    // if (err) {
-    //     printk("bt_le_scan_start() failed: %d\n", err);
-    //     return;
-    // }
-
-    printk("Scanning for broadcasts…\n");
-    while (1) {
-        k_sleep(K_SECONDS(60));
-    }
-}
-
-#define CS_STACK_SIZE 2048
-#define CS_PRIORITY   5
-K_THREAD_STACK_DEFINE(cs_stack, CS_STACK_SIZE);
-static struct k_thread cs_thread_data;
-
-#define CL_STACK_SIZE 1024
-#define CL_PRIORITY   6
-K_THREAD_STACK_DEFINE(cl_stack, CL_STACK_SIZE);
-static struct k_thread cl_thread_data;
-
-static struct bt_le_scan_cb adv_cb = { .recv = scan_cb_adv };
-static struct bt_scan_init_param scan_init_param = {
-    .scan_param = &scan_params,
-    .conn_param = BT_LE_CONN_PARAM_DEFAULT,
-    .connect_if_match = 1,
-};
-
-int main(void)
-{
-    int err;
-
-    dk_leds_init();
-    LOG_INF("Starting dual‑mode application");
-
-    /* 1) Bring up Bluetooth once */
-    err = bt_enable(NULL);
-    if (err) {
-        LOG_ERR("bt_enable failed: %d", err);
-        return 0;
-    }
-
-	/* 2) Setup the filtered-connection logic via bt_scan */
-	bt_scan_init(&scan_init_param);
-	// if (err) {
-	// 	LOG_ERR("scan_init failed: %d", err);
-	// 	return 0;
-	// }
-	err = bt_scan_filter_add(BT_SCAN_FILTER_TYPE_UUID, BT_UUID_RANGING_SERVICE);
-	if (err) {
-			LOG_ERR("bt_scan_filter_add failed: %d", err);
-			return 0;
-		}
-	err = bt_scan_filter_enable(BT_SCAN_UUID_FILTER, false);
-	if (err) { 
-		LOG_ERR("bt_scan_filter_enable failed: %d", err);
-		return 0;
-	}
-	err = bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE);
-	if (err) {
-		LOG_ERR("bt_scan_start failed: %d", err);
-		return 0;
-	}
-
-
-    /* 5) Spawn the two worker threads */
-    k_thread_create(&cs_thread_data, cs_stack, CS_STACK_SIZE,
-                    cs_initiator_thread, NULL, NULL, NULL,
-                    CS_PRIORITY, 0, K_NO_WAIT);
-
-    k_thread_create(&cl_thread_data, cl_stack, CL_STACK_SIZE,
-                    cl_receiver_thread, NULL, NULL, NULL,
-                    CL_PRIORITY, 0, K_NO_WAIT);
-
-    /* main goes idle */
-    return 0;
 }
