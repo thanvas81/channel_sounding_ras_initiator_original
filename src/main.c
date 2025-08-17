@@ -712,20 +712,64 @@ int main(void)
 
 	k_sem_take(&sem_cs_security_enabled, K_FOREVER);
 
+	// const struct bt_le_cs_set_procedure_parameters_param procedure_params = {
+	// 	.config_id = CS_CONFIG_ID,
+	// 	.max_procedure_len = 1000,
+	// 	.min_procedure_interval = 10,
+	// 	.max_procedure_interval = 10,
+	// 	.max_procedure_count = 0,
+	// 	.min_subevent_len = 60000,
+	// 	.max_subevent_len = 60000,
+	// 	.tone_antenna_config_selection = BT_LE_CS_TONE_ANTENNA_CONFIGURATION_A1_B1,
+	// 	.phy = BT_LE_CS_PROCEDURE_PHY_1M,
+	// 	.tx_power_delta = 0x80,
+	// 	.preferred_peer_antenna = BT_LE_CS_PROCEDURE_PREFERRED_PEER_ANTENNA_1,
+	// 	.snr_control_initiator = BT_LE_CS_SNR_CONTROL_NOT_USED,
+	// 	.snr_control_reflector = BT_LE_CS_SNR_CONTROL_NOT_USED,
+	// };
+
+	// err = bt_le_cs_set_procedure_parameters(connection, &procedure_params);
+	// if (err) {
+	// 	LOG_ERR("Failed to set procedure parameters (err %d)", err);
+	// 	return 0;
+	// }
+
+	// struct bt_le_cs_procedure_enable_param params = {
+	// 	.config_id = CS_CONFIG_ID,
+	// 	.enable = 1,
+	// };
+
+	// err = bt_le_cs_procedure_enable(connection, &params);
+	// if (err) {
+	// 	LOG_ERR("Failed to enable CS procedures (err %d)", err);
+	// 	return 0;
+	// }
+	// #ifndef CS_SLOT
+	// #endif
+	// #define CS_SLOT 0           /* build A: -DCS_SLOT=0, build B: -DCS_SLOT=1 */
+	#define CS_SLOT 1           /* build A: -DCS_SLOT=0, build B: -DCS_SLOT=1 */
+
+	const uint16_t subevent_len_us   = 12000;           /* 12 ms (instead of 60 ms) */
+	const uint16_t proc_interval_min = (CS_SLOT == 0) ? 10 : 16;  /* A:10, B:16 */
+	const uint16_t proc_interval_max = proc_interval_min;
+
+	/* Bound the overall procedure length so scheduler can interleave cleanly */
+	const uint16_t max_proc_len_ms   = 600;             /* shorter than 1000 */
+
 	const struct bt_le_cs_set_procedure_parameters_param procedure_params = {
-		.config_id = CS_CONFIG_ID,
-		.max_procedure_len = 1000,
-		.min_procedure_interval = 10,
-		.max_procedure_interval = 10,
-		.max_procedure_count = 0,
-		.min_subevent_len = 60000,
-		.max_subevent_len = 60000,
-		.tone_antenna_config_selection = BT_LE_CS_TONE_ANTENNA_CONFIGURATION_A1_B1,
-		.phy = BT_LE_CS_PROCEDURE_PHY_1M,
-		.tx_power_delta = 0x80,
-		.preferred_peer_antenna = BT_LE_CS_PROCEDURE_PREFERRED_PEER_ANTENNA_1,
-		.snr_control_initiator = BT_LE_CS_SNR_CONTROL_NOT_USED,
-		.snr_control_reflector = BT_LE_CS_SNR_CONTROL_NOT_USED,
+		.config_id                      = CS_CONFIG_ID,
+		.max_procedure_len              = max_proc_len_ms,
+		.min_procedure_interval         = proc_interval_min,
+		.max_procedure_interval         = proc_interval_max,
+		.max_procedure_count            = 0, /* continuous */
+		.min_subevent_len               = subevent_len_us,
+		.max_subevent_len               = subevent_len_us,
+		.tone_antenna_config_selection  = BT_LE_CS_TONE_ANTENNA_CONFIGURATION_A1_B1,
+		.phy                             = BT_LE_CS_PROCEDURE_PHY_1M,   /* or 2M if both sides support */
+		.tx_power_delta                  = 0x80,
+		.preferred_peer_antenna          = BT_LE_CS_PROCEDURE_PREFERRED_PEER_ANTENNA_1,
+		.snr_control_initiator           = BT_LE_CS_SNR_CONTROL_NOT_USED,
+		.snr_control_reflector           = BT_LE_CS_SNR_CONTROL_NOT_USED,
 	};
 
 	err = bt_le_cs_set_procedure_parameters(connection, &procedure_params);
@@ -736,7 +780,7 @@ int main(void)
 
 	struct bt_le_cs_procedure_enable_param params = {
 		.config_id = CS_CONFIG_ID,
-		.enable = 1,
+		.enable    = BT_CONN_LE_CS_PROCEDURES_ENABLED,
 	};
 
 	err = bt_le_cs_procedure_enable(connection, &params);
@@ -744,7 +788,6 @@ int main(void)
 		LOG_ERR("Failed to enable CS procedures (err %d)", err);
 		return 0;
 	}
-
 	while (true) {
 		k_sleep(K_MSEC(5000));
 
