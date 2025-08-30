@@ -30,7 +30,8 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 
 #define CON_STATUS_LED DK_LED1
 
-#define CS_CONFIG_ID	       0
+#define CS_CONFIG_ID	       1
+#define CS_SLOT  	CS_CONFIG_ID 
 #define NUM_MODE_0_STEPS       3
 #define PROCEDURE_COUNTER_NONE (-1)
 #define DE_SLIDING_WINDOW_SIZE (10)
@@ -234,7 +235,7 @@ static void ranging_data_ready_cb(struct bt_conn *conn, uint16_t ranging_counter
 
 static void ranging_data_overwritten_cb(struct bt_conn *conn, uint16_t ranging_counter)
 {
-	LOG_INF("Ranging data overwritten %i", ranging_counter);
+	LOG_DBG("Ranging data overwritten %u", ranging_counter);
 }
 
 static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
@@ -546,7 +547,7 @@ static uint8_t hello_notify_cb(struct bt_conn *conn,
         return BT_GATT_ITER_STOP;
     }
 
-    LOG_INF("🔔 Notification received: %.*s", length, (const char *)data);
+    LOG_INF("🔔 Notification received: IN%d%.*s", CS_CONFIG_ID, length, (const char *)data);
     return BT_GATT_ITER_CONTINUE;
 }
 
@@ -743,11 +744,10 @@ int main(void)
 	// if (err) {
 	// 	LOG_ERR("Failed to enable CS procedures (err %d)", err);
 	// 	return 0;
-	// }
+	// }          /* build A: -DCS_SLOT=0, build B: -DCS_SLOT=1 */
 	// #ifndef CS_SLOT
 	// #endif
 	// #define CS_SLOT 0           /* build A: -DCS_SLOT=0, build B: -DCS_SLOT=1 */
-	#define CS_SLOT 1           /* build A: -DCS_SLOT=0, build B: -DCS_SLOT=1 */
 
 	const uint16_t subevent_len_us   = 12000;           /* 12 ms (instead of 60 ms) */
 	const uint16_t proc_interval_min = (CS_SLOT == 0) ? 10 : 16;  /* A:10, B:16 */
@@ -803,7 +803,7 @@ int main(void)
 			}
 		}
 
-		LOG_INF("Sleeping for a few seconds...");
+		// LOG_INF("Sleeping for a few seconds...");
 	}
 
 	return 0;
