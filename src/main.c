@@ -843,7 +843,7 @@ int main(void)
 		.min_subevent_len = subevent_len_us,
 		.max_subevent_len = subevent_len_us,
 		.tone_antenna_config_selection = BT_LE_CS_TONE_ANTENNA_CONFIGURATION_A1_B1,
-		.phy = BT_LE_CS_PROCEDURE_PHY_1M, /* or 2M if both sides support */
+		.phy = BT_LE_CS_PROCEDURE_PHY_2M, /* or 2M if both sides support */
 		.tx_power_delta = 0x80,
 		.preferred_peer_antenna = BT_LE_CS_PROCEDURE_PREFERRED_PEER_ANTENNA_1,
 		.snr_control_initiator = BT_LE_CS_SNR_CONTROL_NOT_USED,
@@ -870,7 +870,7 @@ int main(void)
 	}
 	while (true)
 	{
-		k_sleep(K_MSEC(5000));
+		k_sleep(K_MSEC(2000));
 
 		if (buffer_num_valid != 0)
 		{
