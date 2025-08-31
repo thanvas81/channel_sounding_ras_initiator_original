@@ -30,19 +30,23 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 
 #define CON_STATUS_LED DK_LED1
 
-#define CS_CONFIG_ID	       1
-#define CS_SLOT  	CS_CONFIG_ID 
-#define NUM_MODE_0_STEPS       3
+#define CS_CONFIG_ID 2
+#define CS_SLOT CS_CONFIG_ID
+#define NUM_MODE_0_STEPS 3
 #define PROCEDURE_COUNTER_NONE (-1)
-#define DE_SLIDING_WINDOW_SIZE (10)
-#define MAX_AP		       (CONFIG_BT_RAS_MAX_ANTENNA_PATHS)
+#define DE_SLIDING_WINDOW_SIZE (16)
+#define MAX_AP (CONFIG_BT_RAS_MAX_ANTENNA_PATHS)
 
-#define LOCAL_PROCEDURE_MEM                                                                        \
-	((BT_RAS_MAX_STEPS_PER_PROCEDURE * sizeof(struct bt_le_cs_subevent_step)) +                \
+#define LOCAL_PROCEDURE_MEM                                                     \
+	((BT_RAS_MAX_STEPS_PER_PROCEDURE * sizeof(struct bt_le_cs_subevent_step)) + \
 	 (BT_RAS_MAX_STEPS_PER_PROCEDURE * BT_RAS_MAX_STEP_DATA_LEN))
 
-#define BT_UUID_CUSTOM_SERVICE_VAL   BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x1234, 0x1234, 0x123456789abc)
-#define BT_UUID_CUSTOM_CHAR_VAL      BT_UUID_128_ENCODE(0xabcdef01, 0x2345, 0x3456, 0x4567, 0x56789abcdef0)
+#define BT_UUID_CUSTOM_SERVICE_VAL BT_UUID_128_ENCODE(0x12345678, 0x1234, 0x1234, 0x1234, 0x123456789abc)
+#define BT_UUID_CUSTOM_CHAR_VAL BT_UUID_128_ENCODE(0xabcdef01, 0x2345, 0x3456, 0x4567, 0x56789abcdef0)
+
+static const float CAL_OFF_IFFT = 0.2f; // measured - 1.0
+static const float CAL_OFF_PHASE = 0.5f;
+static const float CAL_OFF_RTT = 3.5f;
 
 static struct bt_uuid_128 custom_service_uuid = BT_UUID_INIT_128(BT_UUID_CUSTOM_SERVICE_VAL);
 static struct bt_uuid_128 custom_char_uuid = BT_UUID_INIT_128(BT_UUID_CUSTOM_CHAR_VAL);
@@ -54,7 +58,7 @@ static K_SEM_DEFINE(sem_connected, 0, 1);
 static K_SEM_DEFINE(sem_discovery_done, 0, 1);
 static K_SEM_DEFINE(sem_mtu_exchange_done, 0, 1);
 static K_SEM_DEFINE(sem_security, 0, 1);
-static K_SEM_DEFINE(sem_local_steps, 1, 1);
+static K_SEM_DEFINE(sem_local_steps, 2, 2);
 K_SEM_DEFINE(sem_custom_service_discovered, 0, 1);
 
 static K_MUTEX_DEFINE(distance_estimate_buffer_mutex);
@@ -69,25 +73,67 @@ static uint8_t buffer_index;
 static uint8_t buffer_num_valid;
 static cs_de_dist_estimates_t distance_estimate_buffer[MAX_AP][DE_SLIDING_WINDOW_SIZE];
 
-
 static void store_distance_estimates(cs_de_report_t *p_report)
 {
 	int lock_state = k_mutex_lock(&distance_estimate_buffer_mutex, K_FOREVER);
 
 	__ASSERT_NO_MSG(lock_state == 0);
 
-	for (uint8_t ap = 0; ap < p_report->n_ap; ap++) {
+	for (uint8_t ap = 0; ap < p_report->n_ap; ap++)
+	{
 		memcpy(&distance_estimate_buffer[ap][buffer_index],
-		       &p_report->distance_estimates[ap], sizeof(cs_de_dist_estimates_t));
+			   &p_report->distance_estimates[ap], sizeof(cs_de_dist_estimates_t));
 	}
 
 	buffer_index = (buffer_index + 1) % DE_SLIDING_WINDOW_SIZE;
 
-	if (buffer_num_valid < DE_SLIDING_WINDOW_SIZE) {
+	if (buffer_num_valid < DE_SLIDING_WINDOW_SIZE)
+	{
 		buffer_num_valid++;
 	}
 
 	k_mutex_unlock(&distance_estimate_buffer_mutex);
+}
+
+static inline cs_de_dist_estimates_t apply_calibration(cs_de_dist_estimates_t in)
+{
+	cs_de_dist_estimates_t out = in;
+	if (isfinite(in.ifft))
+		out.ifft = in.ifft - CAL_OFF_IFFT;
+	if (isfinite(in.phase_slope))
+		out.phase_slope = in.phase_slope - CAL_OFF_PHASE;
+	if (isfinite(in.rtt))
+		out.rtt = in.rtt - CAL_OFF_RTT;
+	return out;
+}
+
+static inline float avg_ifft_phase(const cs_de_dist_estimates_t d)
+{
+	const bool fi = isfinite(d.ifft);
+	const bool fp = isfinite(d.phase_slope);
+
+	if (fi && fp)
+		return 0.5f * (d.ifft + d.phase_slope); // equal weight
+	if (fi)
+		return d.ifft; // only IFFT valid
+	if (fp)
+		return d.phase_slope; // only Phase valid
+	return NAN;				  // neither valid
+}
+
+static inline uint16_t slot_to_interval_ms(uint8_t slot)
+{
+	switch (slot)
+	{
+	case 0:
+		return 12; // A
+	case 1:
+		return 19; // B
+	case 2:
+		return 27; // C
+	default:
+		return 33;
+	}
 }
 
 static cs_de_dist_estimates_t get_distance(uint8_t ap)
@@ -101,16 +147,20 @@ static cs_de_dist_estimates_t get_distance(uint8_t ap)
 
 	__ASSERT_NO_MSG(lock_state == 0);
 
-	for (uint8_t i = 0; i < buffer_num_valid; i++) {
-		if (isfinite(distance_estimate_buffer[ap][i].ifft)) {
+	for (uint8_t i = 0; i < buffer_num_valid; i++)
+	{
+		if (isfinite(distance_estimate_buffer[ap][i].ifft))
+		{
 			num_ifft++;
 			averaged_result.ifft += distance_estimate_buffer[ap][i].ifft;
 		}
-		if (isfinite(distance_estimate_buffer[ap][i].phase_slope)) {
+		if (isfinite(distance_estimate_buffer[ap][i].phase_slope))
+		{
 			num_phase_slope++;
 			averaged_result.phase_slope += distance_estimate_buffer[ap][i].phase_slope;
 		}
-		if (isfinite(distance_estimate_buffer[ap][i].rtt)) {
+		if (isfinite(distance_estimate_buffer[ap][i].rtt))
+		{
 			num_rtt++;
 			averaged_result.rtt += distance_estimate_buffer[ap][i].rtt;
 		}
@@ -118,15 +168,18 @@ static cs_de_dist_estimates_t get_distance(uint8_t ap)
 
 	k_mutex_unlock(&distance_estimate_buffer_mutex);
 
-	if (num_ifft) {
+	if (num_ifft)
+	{
 		averaged_result.ifft /= num_ifft;
 	}
 
-	if (num_phase_slope) {
+	if (num_phase_slope)
+	{
 		averaged_result.phase_slope /= num_phase_slope;
 	}
 
-	if (num_rtt) {
+	if (num_rtt)
+	{
 		averaged_result.rtt /= num_rtt;
 	}
 
@@ -137,9 +190,10 @@ static void ranging_data_get_complete_cb(struct bt_conn *conn, uint16_t ranging_
 {
 	ARG_UNUSED(conn);
 
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Error when getting ranging data with ranging counter %d (err %d)",
-			ranging_counter, err);
+				ranging_counter, err);
 		return;
 	}
 
@@ -149,7 +203,7 @@ static void ranging_data_get_complete_cb(struct bt_conn *conn, uint16_t ranging_
 	static cs_de_report_t cs_de_report;
 
 	cs_de_populate_report(&latest_local_steps, &latest_peer_steps, BT_CONN_LE_CS_ROLE_INITIATOR,
-			      &cs_de_report);
+						  &cs_de_report);
 
 	net_buf_simple_reset(&latest_local_steps);
 	net_buf_simple_reset(&latest_peer_steps);
@@ -157,9 +211,12 @@ static void ranging_data_get_complete_cb(struct bt_conn *conn, uint16_t ranging_
 
 	cs_de_quality_t quality = cs_de_calc(&cs_de_report);
 
-	if (quality == CS_DE_QUALITY_OK) {
-		for (uint8_t ap = 0; ap < cs_de_report.n_ap; ap++) {
-			if (cs_de_report.tone_quality[ap] == CS_DE_TONE_QUALITY_OK) {
+	if (quality == CS_DE_QUALITY_OK)
+	{
+		for (uint8_t ap = 0; ap < cs_de_report.n_ap; ap++)
+		{
+			if (cs_de_report.tone_quality[ap] == CS_DE_TONE_QUALITY_OK)
+			{
 				store_distance_estimates(&cs_de_report);
 			}
 		}
@@ -168,15 +225,17 @@ static void ranging_data_get_complete_cb(struct bt_conn *conn, uint16_t ranging_
 
 static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subevent_result *result)
 {
-	if (dropped_ranging_counter == result->header.procedure_counter) {
+	if (dropped_ranging_counter == result->header.procedure_counter)
+	{
 		return;
 	}
 
-	if (most_recent_local_ranging_counter
-		!= bt_ras_rreq_get_ranging_counter(result->header.procedure_counter)) {
+	if (most_recent_local_ranging_counter != bt_ras_rreq_get_ranging_counter(result->header.procedure_counter))
+	{
 		int sem_state = k_sem_take(&sem_local_steps, K_NO_WAIT);
 
-		if (sem_state < 0) {
+		if (sem_state < 0)
+		{
 			dropped_ranging_counter = result->header.procedure_counter;
 			LOG_DBG("Dropped subevent results due to unfinished ranging data request.");
 			return;
@@ -186,18 +245,24 @@ static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subeve
 			bt_ras_rreq_get_ranging_counter(result->header.procedure_counter);
 	}
 
-	if (result->header.subevent_done_status == BT_CONN_LE_CS_SUBEVENT_ABORTED) {
+	if (result->header.subevent_done_status == BT_CONN_LE_CS_SUBEVENT_ABORTED)
+	{
 		/* The steps from this subevent will not be used. */
-	} else if (result->step_data_buf) {
-		if (result->step_data_buf->len <= net_buf_simple_tailroom(&latest_local_steps)) {
+	}
+	else if (result->step_data_buf)
+	{
+		if (result->step_data_buf->len <= net_buf_simple_tailroom(&latest_local_steps))
+		{
 			uint16_t len = result->step_data_buf->len;
 			uint8_t *step_data = net_buf_simple_pull_mem(result->step_data_buf, len);
 
 			net_buf_simple_add_mem(&latest_local_steps, step_data, len);
-		} else {
+		}
+		else
+		{
 			LOG_ERR("Not enough memory to store step data. (%d > %d)",
-				latest_local_steps.len + result->step_data_buf->len,
-				latest_local_steps.size);
+					latest_local_steps.len + result->step_data_buf->len,
+					latest_local_steps.size);
 			net_buf_simple_reset(&latest_local_steps);
 			dropped_ranging_counter = result->header.procedure_counter;
 			return;
@@ -206,30 +271,38 @@ static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subeve
 
 	dropped_ranging_counter = PROCEDURE_COUNTER_NONE;
 
-	if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_COMPLETE) {
+	if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_COMPLETE)
+	{
 		most_recent_local_ranging_counter =
 			bt_ras_rreq_get_ranging_counter(result->header.procedure_counter);
-	} else if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_ABORTED) {
+	}
+	else if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_ABORTED)
+	{
 		LOG_WRN("Procedure %u aborted", result->header.procedure_counter);
 		net_buf_simple_reset(&latest_local_steps);
 		k_sem_give(&sem_local_steps);
 	}
 }
 
-static void ranging_data_ready_cb(struct bt_conn *conn, uint16_t ranging_counter)
-{
-	LOG_DBG("Ranging data ready %i", ranging_counter);
+static uint16_t last_requested_counter = 0xFFFF;
 
-	if (ranging_counter == most_recent_local_ranging_counter) {
-		int err = bt_ras_rreq_cp_get_ranging_data(connection, &latest_peer_steps,
-							  ranging_counter,
-							  ranging_data_get_complete_cb);
-		if (err) {
-			LOG_ERR("Get ranging data failed (err %d)", err);
-			net_buf_simple_reset(&latest_local_steps);
-			net_buf_simple_reset(&latest_peer_steps);
-			k_sem_give(&sem_local_steps);
-		}
+static void ranging_data_ready_cb(struct bt_conn *conn, uint16_t rc)
+{
+	LOG_DBG("Ranging data ready %u", rc);
+
+	if (rc == last_requested_counter)
+	{
+		return; // already requested this one
+	}
+	last_requested_counter = rc;
+
+	int err = bt_ras_rreq_cp_get_ranging_data(connection, &latest_peer_steps,rc, ranging_data_get_complete_cb);
+	if (err)
+	{
+		LOG_ERR("Get ranging data failed (err %d)", err);
+		net_buf_simple_reset(&latest_local_steps);
+		net_buf_simple_reset(&latest_peer_steps);
+		k_sem_give(&sem_local_steps);
 	}
 }
 
@@ -239,9 +312,10 @@ static void ranging_data_overwritten_cb(struct bt_conn *conn, uint16_t ranging_c
 }
 
 static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
-			    struct bt_gatt_exchange_params *params)
+							struct bt_gatt_exchange_params *params)
 {
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("MTU exchange failed (err %d)", err);
 		return;
 	}
@@ -261,12 +335,14 @@ static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
 	bt_gatt_dm_data_print(dm);
 
 	err = bt_ras_rreq_alloc_and_assign_handles(dm, conn);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("RAS RREQ alloc init failed (err %d)", err);
 	}
 
 	err = bt_gatt_dm_data_release(dm);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Could not release the discovery data (err %d)", err);
 	}
 
@@ -297,9 +373,10 @@ static void security_changed(struct bt_conn *conn, bt_security_t level, enum bt_
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Security failed: %s level %u err %d %s", addr, level, err,
-			bt_security_err_to_str(err));
+				bt_security_err_to_str(err));
 		return;
 	}
 
@@ -320,7 +397,8 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
 	(void)bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 	LOG_INF("Connected to %s (err 0x%02X)", addr, err);
 
-	if (err) {
+	if (err)
+	{
 		bt_conn_unref(conn);
 		connection = NULL;
 	}
@@ -344,30 +422,36 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 }
 
 static void remote_capabilities_cb(struct bt_conn *conn,
-				   uint8_t status,
-				   struct bt_conn_le_cs_capabilities *params)
+								   uint8_t status,
+								   struct bt_conn_le_cs_capabilities *params)
 {
 	ARG_UNUSED(conn);
 	ARG_UNUSED(params);
 
-	if (status == BT_HCI_ERR_SUCCESS) {
+	if (status == BT_HCI_ERR_SUCCESS)
+	{
 		LOG_INF("CS capability exchange completed.");
 		k_sem_give(&sem_remote_capabilities_obtained);
-	} else {
+	}
+	else
+	{
 		LOG_WRN("CS capability exchange failed. (HCI status 0x%02x)", status);
 	}
 }
 
 static void config_create_cb(struct bt_conn *conn,
-			     uint8_t status,
-			     struct bt_conn_le_cs_config *config)
+							 uint8_t status,
+							 struct bt_conn_le_cs_config *config)
 {
 	ARG_UNUSED(conn);
 
-	if (status == BT_HCI_ERR_SUCCESS) {
+	if (status == BT_HCI_ERR_SUCCESS)
+	{
 		LOG_INF("CS config creation complete. ID: %d", config->id);
 		k_sem_give(&sem_config_created);
-	} else {
+	}
+	else
+	{
 		LOG_WRN("CS config creation failed. (HCI status 0x%02x)", status);
 	}
 }
@@ -376,48 +460,57 @@ static void security_enable_cb(struct bt_conn *conn, uint8_t status)
 {
 	ARG_UNUSED(conn);
 
-	if (status == BT_HCI_ERR_SUCCESS) {
+	if (status == BT_HCI_ERR_SUCCESS)
+	{
 		LOG_INF("CS security enabled.");
 		k_sem_give(&sem_cs_security_enabled);
-	} else {
+	}
+	else
+	{
 		LOG_WRN("CS security enable failed. (HCI status 0x%02x)", status);
 	}
 }
 
 static void procedure_enable_cb(struct bt_conn *conn,
-				uint8_t status,
-				struct bt_conn_le_cs_procedure_enable_complete *params)
+								uint8_t status,
+								struct bt_conn_le_cs_procedure_enable_complete *params)
 {
 	ARG_UNUSED(conn);
 
-	if (status == BT_HCI_ERR_SUCCESS) {
-		if (params->state == 1) {
+	if (status == BT_HCI_ERR_SUCCESS)
+	{
+		if (params->state == 1)
+		{
 			LOG_INF("CS procedures enabled:\n"
-				" - config ID: %u\n"
-				" - antenna configuration index: %u\n"
-				" - TX power: %d dbm\n"
-				" - subevent length: %u us\n"
-				" - subevents per event: %u\n"
-				" - subevent interval: %u\n"
-				" - event interval: %u\n"
-				" - procedure interval: %u\n"
-				" - procedure count: %u\n"
-				" - maximum procedure length: %u",
-				params->config_id, params->tone_antenna_config_selection,
-				params->selected_tx_power, params->subevent_len,
-				params->subevents_per_event, params->subevent_interval,
-				params->event_interval, params->procedure_interval,
-				params->procedure_count, params->max_procedure_len);
-		} else {
+					" - config ID: %u\n"
+					" - antenna configuration index: %u\n"
+					" - TX power: %d dbm\n"
+					" - subevent length: %u us\n"
+					" - subevents per event: %u\n"
+					" - subevent interval: %u\n"
+					" - event interval: %u\n"
+					" - procedure interval: %u\n"
+					" - procedure count: %u\n"
+					" - maximum procedure length: %u",
+					params->config_id, params->tone_antenna_config_selection,
+					params->selected_tx_power, params->subevent_len,
+					params->subevents_per_event, params->subevent_interval,
+					params->event_interval, params->procedure_interval,
+					params->procedure_count, params->max_procedure_len);
+		}
+		else
+		{
 			LOG_INF("CS procedures disabled.");
 		}
-	} else {
+	}
+	else
+	{
 		LOG_WRN("CS procedures enable failed. (HCI status 0x%02x)", status);
 	}
 }
 
 static void scan_filter_match(struct bt_scan_device_info *device_info,
-			      struct bt_scan_filter_match *filter_match, bool connectable)
+							  struct bt_scan_filter_match *filter_match, bool connectable)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
 
@@ -433,7 +526,8 @@ static void scan_connecting_error(struct bt_scan_device_info *device_info)
 	LOG_INF("Connecting failed, restarting scanning");
 
 	err = bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Failed to restart scanning (err %i)", err);
 		return;
 	}
@@ -457,13 +551,15 @@ static int scan_init(void)
 	bt_scan_cb_register(&scan_cb);
 
 	err = bt_scan_filter_add(BT_SCAN_FILTER_TYPE_UUID, BT_UUID_RANGING_SERVICE);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Scanning filters cannot be set (err %d)", err);
 		return err;
 	}
 
 	err = bt_scan_filter_enable(BT_SCAN_UUID_FILTER, false);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Filters cannot be turned on (err %d)", err);
 		return err;
 	}
@@ -483,15 +579,20 @@ BT_CONN_CB_DEFINE(conn_cb) = {
 	.le_cs_subevent_data_available = subevent_result_cb,
 };
 
-static uint8_t  read_hello_char_cb(struct bt_conn *conn, uint8_t err,
-                               struct bt_gatt_read_params *params,
-                               const void *data, uint16_t length)
+static uint8_t read_hello_char_cb(struct bt_conn *conn, uint8_t err,
+								  struct bt_gatt_read_params *params,
+								  const void *data, uint16_t length)
 {
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Failed to read characteristic (err 0x%02x)", err);
-	} else if (data) {
+	}
+	else if (data)
+	{
 		LOG_INF("✅ Read value: %.*s", length, (const char *)data);
-	} else {
+	}
+	else
+	{
 		LOG_WRN("No data received in read callback");
 	}
 }
@@ -500,11 +601,10 @@ static struct bt_gatt_read_params read_params = {
 	.func = read_hello_char_cb,
 	.handle_count = 1,
 	.single = {
-		.handle = 0,  // Will be filled in later
+		.handle = 0, // Will be filled in later
 		.offset = 0,
 	},
 };
-
 
 static uint16_t hello_char_handle;
 
@@ -513,23 +613,25 @@ static void custom_service_discovery_completed_cb(struct bt_gatt_dm *dm, void *c
 	LOG_INF("✅ Custom service discovered!");
 
 	const struct bt_gatt_dm_attr *chrc = bt_gatt_dm_char_by_uuid(dm, BT_UUID_DECLARE_128(BT_UUID_CUSTOM_CHAR_VAL));
-	if (!chrc) {
+	if (!chrc)
+	{
 		LOG_ERR("Custom char not found");
 		goto release;
 	}
-	
+
 	const struct bt_gatt_dm_attr *gatt_desc = bt_gatt_dm_desc_by_uuid(dm, chrc, BT_UUID_DECLARE_128(BT_UUID_CUSTOM_CHAR_VAL));
-	if (!gatt_desc) {
+	if (!gatt_desc)
+	{
 		LOG_ERR("Char value descriptor not found");
 		goto release;
 	}
-	
+
 	hello_char_handle = gatt_desc->handle;
 	LOG_INF("🔑 Got HelloBLE char handle: 0x%04X", hello_char_handle);
-	
-	release:
+
+release:
 	bt_gatt_dm_data_release(dm);
-	k_sem_give(&sem_custom_service_discovered);  // Add this
+	k_sem_give(&sem_custom_service_discovered); // Add this
 }
 
 static struct bt_gatt_dm_cb custom_service_discovery_cb = {
@@ -539,16 +641,17 @@ static struct bt_gatt_dm_cb custom_service_discovery_cb = {
 };
 
 static uint8_t hello_notify_cb(struct bt_conn *conn,
-                               struct bt_gatt_subscribe_params *params,
-                               const void *data, uint16_t length)
+							   struct bt_gatt_subscribe_params *params,
+							   const void *data, uint16_t length)
 {
-    if (!data) {
-        LOG_INF("Notification disabled");
-        return BT_GATT_ITER_STOP;
-    }
+	if (!data)
+	{
+		LOG_INF("Notification disabled");
+		return BT_GATT_ITER_STOP;
+	}
 
-    LOG_INF("🔔 Notification received: IN%d%.*s", CS_CONFIG_ID, length, (const char *)data);
-    return BT_GATT_ITER_CONTINUE;
+	LOG_INF("🔔 Notification received: IN%d%.*s", CS_CONFIG_ID, length, (const char *)data);
+	return BT_GATT_ITER_CONTINUE;
 }
 
 int main(void)
@@ -560,19 +663,22 @@ int main(void)
 	dk_leds_init();
 
 	err = bt_enable(NULL);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Bluetooth init failed (err %d)", err);
 		return 0;
 	}
 
 	err = scan_init();
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Scan init failed (err %d)", err);
 		return 0;
 	}
 
 	err = bt_scan_start(BT_SCAN_TYPE_SCAN_PASSIVE);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Scanning failed to start (err %i)", err);
 		return 0;
 	}
@@ -580,7 +686,8 @@ int main(void)
 	k_sem_take(&sem_connected, K_FOREVER);
 
 	err = bt_conn_set_security(connection, BT_SECURITY_L2);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Failed to encrypt connection (err %d)", err);
 		return 0;
 	}
@@ -594,13 +701,15 @@ int main(void)
 	k_sem_take(&sem_mtu_exchange_done, K_FOREVER);
 
 	err = bt_gatt_dm_start(connection, BT_UUID_RANGING_SERVICE, &discovery_cb, NULL);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Discovery failed (err %d)", err);
 		return 0;
 	}
 	k_sem_take(&sem_discovery_done, K_FOREVER);
 	err = bt_gatt_dm_start(connection, &custom_service_uuid.uuid, &custom_service_discovery_cb, NULL);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Custom service discovery failed (err %d)", err);
 		return 0;
 	}
@@ -609,12 +718,14 @@ int main(void)
 	subscribe_params.value_handle = hello_char_handle;
 	subscribe_params.notify = hello_notify_cb;
 	subscribe_params.value = BT_GATT_CCC_NOTIFY;
-	
 
 	err = bt_gatt_subscribe(connection, &subscribe_params);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Failed to subscribe to notifications (err %d)", err);
-	} else {
+	}
+	else
+	{
 		LOG_INF("✅ Subscribed to notifications");
 	}
 
@@ -622,15 +733,10 @@ int main(void)
 	read_params.single.handle = hello_char_handle;
 
 	err = bt_gatt_read(connection, &read_params);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("GATT read failed (err %d)", err);
 	}
-	// static struct bt_gatt_read_params read_params = {0};
-
-	// read_params.func = read_hello_char_cb;
-	// read_params.handle_count = 1;
-	// read_params.single.handle = 0;  // to be set later
-	// read_params.single.offset = 0;
 
 	const struct bt_le_cs_set_default_settings_param default_settings = {
 		.enable_initiator_role = true,
@@ -640,37 +746,43 @@ int main(void)
 	};
 
 	err = bt_le_cs_set_default_settings(connection, &default_settings);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Failed to configure default CS settings (err %d)", err);
 		return 0;
 	}
 
 	err = bt_ras_rreq_rd_overwritten_subscribe(connection, ranging_data_overwritten_cb);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("RAS RREQ ranging data overwritten subscribe failed (err %d)", err);
 		return 0;
 	}
 
 	err = bt_ras_rreq_rd_ready_subscribe(connection, ranging_data_ready_cb);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("RAS RREQ ranging data ready subscribe failed (err %d)", err);
 		return 0;
 	}
 
 	err = bt_ras_rreq_on_demand_rd_subscribe(connection);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("RAS RREQ On-demand ranging data subscribe failed (err %d)", err);
 		return 0;
 	}
 
 	err = bt_ras_rreq_cp_subscribe(connection);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("RAS RREQ CP subscribe failed (err %d)", err);
 		return 0;
 	}
 
 	err = bt_le_cs_read_remote_supported_capabilities(connection);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Failed to exchange CS capabilities (err %d)", err);
 		return 0;
 	}
@@ -697,8 +809,9 @@ int main(void)
 	bt_le_cs_set_valid_chmap_bits(config_params.channel_map);
 
 	err = bt_le_cs_create_config(connection, &config_params,
-				     BT_LE_CS_CREATE_CONFIG_CONTEXT_LOCAL_AND_REMOTE);
-	if (err) {
+								 BT_LE_CS_CREATE_CONFIG_CONTEXT_LOCAL_AND_REMOTE);
+	if (err)
+	{
 		LOG_ERR("Failed to create CS config (err %d)", err);
 		return 0;
 	}
@@ -706,104 +819,69 @@ int main(void)
 	k_sem_take(&sem_config_created, K_FOREVER);
 
 	err = bt_le_cs_security_enable(connection);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Failed to start CS Security (err %d)", err);
 		return 0;
 	}
 
 	k_sem_take(&sem_cs_security_enabled, K_FOREVER);
-
-	// const struct bt_le_cs_set_procedure_parameters_param procedure_params = {
-	// 	.config_id = CS_CONFIG_ID,
-	// 	.max_procedure_len = 1000,
-	// 	.min_procedure_interval = 10,
-	// 	.max_procedure_interval = 10,
-	// 	.max_procedure_count = 0,
-	// 	.min_subevent_len = 60000,
-	// 	.max_subevent_len = 60000,
-	// 	.tone_antenna_config_selection = BT_LE_CS_TONE_ANTENNA_CONFIGURATION_A1_B1,
-	// 	.phy = BT_LE_CS_PROCEDURE_PHY_1M,
-	// 	.tx_power_delta = 0x80,
-	// 	.preferred_peer_antenna = BT_LE_CS_PROCEDURE_PREFERRED_PEER_ANTENNA_1,
-	// 	.snr_control_initiator = BT_LE_CS_SNR_CONTROL_NOT_USED,
-	// 	.snr_control_reflector = BT_LE_CS_SNR_CONTROL_NOT_USED,
-	// };
-
-	// err = bt_le_cs_set_procedure_parameters(connection, &procedure_params);
-	// if (err) {
-	// 	LOG_ERR("Failed to set procedure parameters (err %d)", err);
-	// 	return 0;
-	// }
-
-	// struct bt_le_cs_procedure_enable_param params = {
-	// 	.config_id = CS_CONFIG_ID,
-	// 	.enable = 1,
-	// };
-
-	// err = bt_le_cs_procedure_enable(connection, &params);
-	// if (err) {
-	// 	LOG_ERR("Failed to enable CS procedures (err %d)", err);
-	// 	return 0;
-	// }          /* build A: -DCS_SLOT=0, build B: -DCS_SLOT=1 */
-	// #ifndef CS_SLOT
-	// #endif
-	// #define CS_SLOT 0           /* build A: -DCS_SLOT=0, build B: -DCS_SLOT=1 */
-
-	const uint16_t subevent_len_us   = 12000;           /* 12 ms (instead of 60 ms) */
-	const uint16_t proc_interval_min = (CS_SLOT == 0) ? 10 : 16;  /* A:10, B:16 */
+	// const uint16_t subevent_len_us = 12000;							 /* 12 ms (instead of 60 ms) */
+	const uint16_t subevent_len_us   = 5000; 
+	const uint16_t proc_interval_min = slot_to_interval_ms(CS_SLOT); /* A:10, B:16 */
 	const uint16_t proc_interval_max = proc_interval_min;
 
 	/* Bound the overall procedure length so scheduler can interleave cleanly */
-	const uint16_t max_proc_len_ms   = 600;             /* shorter than 1000 */
+	const uint16_t max_proc_len_ms = 600; /* shorter than 1000 */
 
 	const struct bt_le_cs_set_procedure_parameters_param procedure_params = {
-		.config_id                      = CS_CONFIG_ID,
-		.max_procedure_len              = max_proc_len_ms,
-		.min_procedure_interval         = proc_interval_min,
-		.max_procedure_interval         = proc_interval_max,
-		.max_procedure_count            = 0, /* continuous */
-		.min_subevent_len               = subevent_len_us,
-		.max_subevent_len               = subevent_len_us,
-		.tone_antenna_config_selection  = BT_LE_CS_TONE_ANTENNA_CONFIGURATION_A1_B1,
-		.phy                             = BT_LE_CS_PROCEDURE_PHY_1M,   /* or 2M if both sides support */
-		.tx_power_delta                  = 0x80,
-		.preferred_peer_antenna          = BT_LE_CS_PROCEDURE_PREFERRED_PEER_ANTENNA_1,
-		.snr_control_initiator           = BT_LE_CS_SNR_CONTROL_NOT_USED,
-		.snr_control_reflector           = BT_LE_CS_SNR_CONTROL_NOT_USED,
+		.config_id = CS_CONFIG_ID,
+		.max_procedure_len = max_proc_len_ms,
+		.min_procedure_interval = proc_interval_min,
+		.max_procedure_interval = proc_interval_max,
+		.max_procedure_count = 0, /* continuous */
+		.min_subevent_len = subevent_len_us,
+		.max_subevent_len = subevent_len_us,
+		.tone_antenna_config_selection = BT_LE_CS_TONE_ANTENNA_CONFIGURATION_A1_B1,
+		.phy = BT_LE_CS_PROCEDURE_PHY_1M, /* or 2M if both sides support */
+		.tx_power_delta = 0x80,
+		.preferred_peer_antenna = BT_LE_CS_PROCEDURE_PREFERRED_PEER_ANTENNA_1,
+		.snr_control_initiator = BT_LE_CS_SNR_CONTROL_NOT_USED,
+		.snr_control_reflector = BT_LE_CS_SNR_CONTROL_NOT_USED,
 	};
-
+	k_sleep(K_MSEC(80 * CS_SLOT));
 	err = bt_le_cs_set_procedure_parameters(connection, &procedure_params);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Failed to set procedure parameters (err %d)", err);
 		return 0;
 	}
 
 	struct bt_le_cs_procedure_enable_param params = {
 		.config_id = CS_CONFIG_ID,
-		.enable    = BT_CONN_LE_CS_PROCEDURES_ENABLED,
+		.enable = BT_CONN_LE_CS_PROCEDURES_ENABLED,
 	};
 
 	err = bt_le_cs_procedure_enable(connection, &params);
-	if (err) {
+	if (err)
+	{
 		LOG_ERR("Failed to enable CS procedures (err %d)", err);
 		return 0;
 	}
-	while (true) {
+	while (true)
+	{
 		k_sleep(K_MSEC(5000));
 
-		if (buffer_num_valid != 0) {
-			for (uint8_t ap = 0; ap < MAX_AP; ap++) {
+		if (buffer_num_valid != 0)
+		{
+			for (uint8_t ap = 0; ap < MAX_AP; ap++)
+			{
 				cs_de_dist_estimates_t distance_on_ap = get_distance(ap);
-
-				LOG_INF("Distance estimates on antenna path %u: ifft: %f, "
-					"phase_slope: %f, rtt: %f",
-					ap, (double)distance_on_ap.ifft,
-					(double)distance_on_ap.phase_slope,
-					(double)distance_on_ap.rtt);
+				cs_de_dist_estimates_t cal = apply_calibration(distance_on_ap);
+				float d_avg = avg_ifft_phase(cal);
+				LOG_INF("Dist=%.3f m  [ifft=%.3f, phase=%.3f]", (double)d_avg, (double)cal.ifft, (double)cal.phase_slope);
 			}
 		}
-
-		// LOG_INF("Sleeping for a few seconds...");
 	}
 
 	return 0;
