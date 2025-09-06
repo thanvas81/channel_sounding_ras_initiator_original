@@ -7,7 +7,7 @@ flowchart TD
         C["Start passive scan – scan_init"]
         D{"Peer with Ranging Service found?"}
         E["Connect + set security"]
-        F["Exchange MTU(Maximum Transmission Unit)"]
+        F["Exchange MTU (Maximum Transmission Unit)"]
         G["Discover Ranging Service + Custom Service"]
         H["Exchange CS capabilities"]
         A --> C --> D
@@ -34,7 +34,7 @@ flowchart TD
     end
 
     %% ===== Connectionless GATT Reception =====
-    subgraph GATT["Connectionless GATT reception"]
+    subgraph GATT["Connectionless GATT Reception"]
     direction TB
         W["Subscribe to custom service characteristic"]
         X["Receive notifications (hello_notify_cb)"]
@@ -42,9 +42,9 @@ flowchart TD
         W --> X --> Y
     end
 
-    %% Connect setup downwards to both runtime paths
-    H --> I
-    H --> W
+    %% Connect setup downwards to subgraphs
+    H --> CS
+    H --> GATT
 
     %% --- Styling (optional) ---
     classDef setup fill:#eef,stroke:#557,stroke-width:1px;
