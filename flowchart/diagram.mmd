@@ -1,0 +1,55 @@
+%%{init: {"theme": "default", "themeVariables": { "background": "white"}}}%%
+flowchart TD
+    %% ===== Setup & Discovery =====
+    subgraph SETUP["Setup & Discovery"]
+    direction TB
+        A["Start"]
+        C["Start passive scan – scan_init"]
+        D{"Peer with Ranging Service found?"}
+        E["Connect + set security"]
+        F["Exchange MTU(Maximum Transmission Unit)"]
+        G["Discover Ranging Service + Custom Service"]
+        H["Exchange CS capabilities"]
+        A --> C --> D
+        D -- "no" --> C
+        D -- "yes" --> E --> F --> G --> H
+    end
+
+    %% ===== Channel Sounding Pipeline =====
+    subgraph CS["Channel Sounding (Initiator)"]
+    direction TB
+        I["Create CS config (ID = CS_CONFIG_ID)"]
+        J["Enable CS security"]
+        K["Set procedure parameters<br/>subevent length, intervals, PHY=2M"]
+        L["Enable CS procedures – continuous"]
+        M["Receive ranging data callbacks<br/>(subevents, results, reports)"]
+        N["Process ranging data:<br/>exchange steps & calculate estimates"]
+        Q{"Quality OK?"}
+        R["Store distance estimates"]
+        S["Calibrate and fuse estimates<br/>(IFFT, Phase, RTT)"]
+        V["Log distance every 2 s"]
+        I --> J --> K --> L --> M --> N --> Q
+        Q -- "no" --> L
+        Q -- "yes" --> R --> S --> V --> L
+    end
+
+    %% ===== Connectionless GATT Reception =====
+    subgraph GATT["Connectionless GATT reception"]
+    direction TB
+        W["Subscribe to custom service characteristic"]
+        X["Receive notifications (hello_notify_cb)"]
+        Y["Log received sensor/env data"]
+        W --> X --> Y
+    end
+
+    %% Connect setup downwards to both runtime paths
+    H --> I
+    H --> W
+
+    %% --- Styling (optional) ---
+    classDef setup fill:#eef,stroke:#557,stroke-width:1px;
+    classDef cs fill:#efe,stroke:#575,stroke-width:1px;
+    classDef gatt fill:#ffe,stroke:#775,stroke-width:1px;
+    class A,C,D,E,F,G,H setup;
+    class I,J,K,L,M,N,Q,R,S,V cs;
+    class W,X,Y gatt;
