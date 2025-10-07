@@ -30,7 +30,7 @@ LOG_MODULE_REGISTER(app_main, LOG_LEVEL_INF);
 
 #define CON_STATUS_LED DK_LED1
 
-#define CS_CONFIG_ID 2
+#define CS_CONFIG_ID 3
 #define CS_SLOT CS_CONFIG_ID
 #define NUM_MODE_0_STEPS 3
 #define PROCEDURE_COUNTER_NONE (-1)
@@ -73,6 +73,7 @@ static uint8_t buffer_index;
 static uint8_t buffer_num_valid;
 static cs_de_dist_estimates_t distance_estimate_buffer[MAX_AP][DE_SLIDING_WINDOW_SIZE];
 static uint16_t active_rc = 0xFFFF;
+static uint16_t pending_ready_rc = 0xFFFF;
 static bool     active_rc_local_done = false;
 static bool     active_rc_ready_seen = false;
 
@@ -229,33 +230,37 @@ static void ranging_data_get_complete_cb(struct bt_conn *conn, uint16_t ranging_
 {
     ARG_UNUSED(conn);
 
-    if (err) {
-        LOG_ERR("Error when getting ranging data with ranging counter %d (err %d)",
-                ranging_counter, err);
-        /* Fall through to cleanup to avoid stuck sem/state */
-    } else {
-        LOG_DBG("Ranging data get completed for rc %d", ranging_counter);
+    if (!err) {
+        if (latest_local_steps.len == 0 || latest_peer_steps.len == 0) {
+            LOG_WRN("Skipping DE: empty buffers (local=%u, peer=%u) for rc=%u",
+                    latest_local_steps.len, latest_peer_steps.len, ranging_counter);
+        } else {
+            LOG_DBG("Ranging data get completed for rc %d", ranging_counter);
 
-        static cs_de_report_t cs_de_report;
-        cs_de_populate_report(&latest_local_steps, &latest_peer_steps,
-                              BT_CONN_LE_CS_ROLE_INITIATOR, &cs_de_report);
+            static cs_de_report_t cs_de_report;
+            cs_de_populate_report(&latest_local_steps, &latest_peer_steps,
+                                  BT_CONN_LE_CS_ROLE_INITIATOR, &cs_de_report);
 
-        cs_de_quality_t quality = cs_de_calc(&cs_de_report);
-        if (quality == CS_DE_QUALITY_OK) {
-            for (uint8_t ap = 0; ap < cs_de_report.n_ap; ap++) {
-                if (cs_de_report.tone_quality[ap] == CS_DE_TONE_QUALITY_OK) {
-                    store_distance_estimates(&cs_de_report);
+            cs_de_quality_t quality = cs_de_calc(&cs_de_report);
+            if (quality == CS_DE_QUALITY_OK) {
+                for (uint8_t ap = 0; ap < cs_de_report.n_ap; ap++) {
+                    if (cs_de_report.tone_quality[ap] == CS_DE_TONE_QUALITY_OK) {
+                        store_distance_estimates(&cs_de_report);
+                    }
                 }
             }
         }
+    } else {
+        LOG_ERR("Error when getting ranging data with rc %u (err %d)", ranging_counter, err);
     }
 
-    /* Clean up and allow next procedure */
+    // unified cleanup
     net_buf_simple_reset(&latest_local_steps);
     net_buf_simple_reset(&latest_peer_steps);
     active_rc = 0xFFFF;
     active_rc_local_done = false;
     active_rc_ready_seen = false;
+    pending_ready_rc = 0xFFFF;
     k_sem_give(&sem_local_steps);
 }
 
@@ -331,18 +336,20 @@ static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subeve
 
     /* New procedure? Take ownership (binary sem) */
     if (active_rc != rc) {
-        if (k_sem_take(&sem_local_steps, K_NO_WAIT) < 0) {
-            dropped_ranging_counter = result->header.procedure_counter;
-            LOG_DBG("Dropped subevent results due to unfinished ranging data request.");
-            return;
-        }
-        /* Start a fresh cycle for this rc */
-        active_rc = rc;
-        active_rc_local_done = false;
-        active_rc_ready_seen = false;
-        net_buf_simple_reset(&latest_local_steps);
-        net_buf_simple_reset(&latest_peer_steps);
-    }
+		if (k_sem_take(&sem_local_steps, K_NO_WAIT) < 0) {
+			dropped_ranging_counter = result->header.procedure_counter;
+			LOG_DBG("Dropped subevent results due to unfinished ranging data request.");
+			return;
+		}
+		/* Start a fresh cycle for this rc */
+		active_rc = rc;
+		active_rc_local_done = false;
+		active_rc_ready_seen = (pending_ready_rc == rc);  // <- adopt early ready
+		pending_ready_rc = 0xFFFF;
+
+		net_buf_simple_reset(&latest_local_steps);
+		net_buf_simple_reset(&latest_peer_steps);
+	}
 
     /* Accumulate local step data (unchanged) */
     if (result->header.subevent_done_status != BT_CONN_LE_CS_SUBEVENT_ABORTED && result->step_data_buf) {
@@ -362,30 +369,43 @@ static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subeve
     dropped_ranging_counter = PROCEDURE_COUNTER_NONE;
 
     if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_COMPLETE) {
-        active_rc_local_done = true;
+    /* mark done only if we really have local steps */
+    active_rc_local_done = (latest_local_steps.len > 0);
 
-        /* Only now, if ready for this same rc already fired, do the GET */
-        if (active_rc_ready_seen) {
-            int err = bt_ras_rreq_cp_get_ranging_data(connection, &latest_peer_steps, active_rc,
-                                                       ranging_data_get_complete_cb);
-            if (err) {
-                LOG_WRN("Get ranging data (rc=%u) failed early (err %d) - dropping", active_rc, err);
-                /* Clean drop of this cycle */
-                net_buf_simple_reset(&latest_local_steps);
-                net_buf_simple_reset(&latest_peer_steps);
-                active_rc = 0xFFFF;
-                active_rc_local_done = false;
-                active_rc_ready_seen = false;
-                k_sem_give(&sem_local_steps);
-            }
-        }
-    } else if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_ABORTED) {
+    if (!active_rc_local_done) {
+        // We have no local data for this rc — drop it early
+        LOG_WRN("No local steps for rc=%u; dropping cycle", active_rc);
+        net_buf_simple_reset(&latest_local_steps);
+        net_buf_simple_reset(&latest_peer_steps);
+        active_rc = 0xFFFF;
+        active_rc_ready_seen = false;
+        pending_ready_rc = 0xFFFF;
+        k_sem_give(&sem_local_steps);
+        return;
+    }
+
+		if (active_rc_ready_seen) {
+			int err = bt_ras_rreq_cp_get_ranging_data(connection, &latest_peer_steps, active_rc,
+													ranging_data_get_complete_cb);
+			if (err) {
+				LOG_WRN("Get ranging data (rc=%u) failed early (err %d) - dropping", active_rc, err);
+				net_buf_simple_reset(&latest_local_steps);
+				net_buf_simple_reset(&latest_peer_steps);
+				active_rc = 0xFFFF;
+				active_rc_local_done = false;
+				active_rc_ready_seen = false;
+				pending_ready_rc = 0xFFFF;
+				k_sem_give(&sem_local_steps);
+			}
+    	}
+	}else if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_ABORTED) {
         LOG_WRN("Procedure %u aborted", result->header.procedure_counter);
         net_buf_simple_reset(&latest_local_steps);
         net_buf_simple_reset(&latest_peer_steps);
         active_rc = 0xFFFF;
         active_rc_local_done = false;
         active_rc_ready_seen = false;
+		pending_ready_rc = 0xFFFF;
         k_sem_give(&sem_local_steps);
     }
 }
@@ -416,14 +436,19 @@ static void ranging_data_ready_cb(struct bt_conn *conn, uint16_t rc)
 {
     LOG_DBG("Ranging data ready %u", rc);
 
-    /* Ignore if it isn’t the one we own */
+    if (active_rc == 0xFFFF) {
+        /* We haven’t claimed any rc yet – remember it */
+        pending_ready_rc = rc;
+        return;
+    }
     if (rc != active_rc) {
+        /* Not the one we own – ignore */
         return;
     }
 
     active_rc_ready_seen = true;
 
-    if (active_rc_local_done) {
+    if (active_rc_local_done && latest_local_steps.len > 0) {
         int err = bt_ras_rreq_cp_get_ranging_data(connection, &latest_peer_steps, rc,
                                                    ranging_data_get_complete_cb);
         if (err) {
@@ -433,6 +458,7 @@ static void ranging_data_ready_cb(struct bt_conn *conn, uint16_t rc)
             active_rc = 0xFFFF;
             active_rc_local_done = false;
             active_rc_ready_seen = false;
+            pending_ready_rc = 0xFFFF;
             k_sem_give(&sem_local_steps);
         }
     }
@@ -456,6 +482,7 @@ static void ranging_data_overwritten_cb(struct bt_conn *conn, uint16_t ranging_c
         active_rc = 0xFFFF;
         active_rc_local_done = false;
         active_rc_ready_seen = false;
+		pending_ready_rc = 0xFFFF;  
         k_sem_give(&sem_local_steps);
     }
 }
@@ -977,12 +1004,17 @@ int main(void)
 
 	k_sem_take(&sem_cs_security_enabled, K_FOREVER);
 	// const uint16_t subevent_len_us = 12000;							 /* 12 ms (instead of 60 ms) */
-	const uint16_t subevent_len_us   = 5000; 
-	const uint16_t proc_interval_min = slot_to_interval_ms(CS_SLOT); /* A:10, B:16 */
-	const uint16_t proc_interval_max = proc_interval_min;
+	// const uint16_t subevent_len_us   = 10000; 
+	// // const uint16_t proc_interval_min = slot_to_interval_ms(CS_SLOT); /* A:10, B:16 */
+	// const uint16_t proc_interval_min = 60; /* A:10, B:16 */
+	// const uint16_t proc_interval_max = proc_interval_min;
 
-	/* Bound the overall procedure length so scheduler can interleave cleanly */
-	const uint16_t max_proc_len_ms = 600; /* shorter than 1000 */
+	// /* Bound the overall procedure length so scheduler can interleave cleanly */
+	// const uint16_t max_proc_len_ms = 600; /* shorter than 1000 */
+	const uint16_t subevent_len_us   = 12000;   // 12 ms to give the radio more room
+	const uint16_t proc_interval_min = 75;      // start conservative: 75 ms
+	const uint16_t proc_interval_max = 75;
+	const uint16_t max_proc_len_ms   = 1000;  
 
 	const struct bt_le_cs_set_procedure_parameters_param procedure_params = {
 		.config_id = CS_CONFIG_ID,
