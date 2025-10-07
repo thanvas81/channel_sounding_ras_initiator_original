@@ -58,7 +58,7 @@ static K_SEM_DEFINE(sem_connected, 0, 1);
 static K_SEM_DEFINE(sem_discovery_done, 0, 1);
 static K_SEM_DEFINE(sem_mtu_exchange_done, 0, 1);
 static K_SEM_DEFINE(sem_security, 0, 1);
-static K_SEM_DEFINE(sem_local_steps, 2, 2);
+static K_SEM_DEFINE(sem_local_steps, 1, 1);
 K_SEM_DEFINE(sem_custom_service_discovered, 0, 1);
 
 static K_MUTEX_DEFINE(distance_estimate_buffer_mutex);
@@ -72,6 +72,9 @@ static int32_t dropped_ranging_counter = PROCEDURE_COUNTER_NONE;
 static uint8_t buffer_index;
 static uint8_t buffer_num_valid;
 static cs_de_dist_estimates_t distance_estimate_buffer[MAX_AP][DE_SLIDING_WINDOW_SIZE];
+static uint16_t active_rc = 0xFFFF;
+static bool     active_rc_local_done = false;
+static bool     active_rc_ready_seen = false;
 
 static void store_distance_estimates(cs_de_report_t *p_report)
 {
@@ -186,130 +189,277 @@ static cs_de_dist_estimates_t get_distance(uint8_t ap)
 	return averaged_result;
 }
 
+// static void ranging_data_get_complete_cb(struct bt_conn *conn, uint16_t ranging_counter, int err)
+// {
+// 	ARG_UNUSED(conn);
+
+// 	if (err)
+// 	{
+// 		LOG_ERR("Error when getting ranging data with ranging counter %d (err %d)",
+// 				ranging_counter, err);
+// 		return;
+// 	}
+
+// 	LOG_DBG("Ranging data get completed for ranging counter %d", ranging_counter);
+
+// 	/* This struct is static to avoid putting it on the stack (it's very large) */
+// 	static cs_de_report_t cs_de_report;
+
+// 	cs_de_populate_report(&latest_local_steps, &latest_peer_steps, BT_CONN_LE_CS_ROLE_INITIATOR,
+// 						  &cs_de_report);
+
+// 	net_buf_simple_reset(&latest_local_steps);
+// 	net_buf_simple_reset(&latest_peer_steps);
+// 	k_sem_give(&sem_local_steps);
+
+// 	cs_de_quality_t quality = cs_de_calc(&cs_de_report);
+
+// 	if (quality == CS_DE_QUALITY_OK)
+// 	{
+// 		for (uint8_t ap = 0; ap < cs_de_report.n_ap; ap++)
+// 		{
+// 			if (cs_de_report.tone_quality[ap] == CS_DE_TONE_QUALITY_OK)
+// 			{
+// 				store_distance_estimates(&cs_de_report);
+// 			}
+// 		}
+// 	}
+// }
 static void ranging_data_get_complete_cb(struct bt_conn *conn, uint16_t ranging_counter, int err)
 {
-	ARG_UNUSED(conn);
+    ARG_UNUSED(conn);
 
-	if (err)
-	{
-		LOG_ERR("Error when getting ranging data with ranging counter %d (err %d)",
-				ranging_counter, err);
-		return;
-	}
+    if (err) {
+        LOG_ERR("Error when getting ranging data with ranging counter %d (err %d)",
+                ranging_counter, err);
+        /* Fall through to cleanup to avoid stuck sem/state */
+    } else {
+        LOG_DBG("Ranging data get completed for rc %d", ranging_counter);
 
-	LOG_DBG("Ranging data get completed for ranging counter %d", ranging_counter);
+        static cs_de_report_t cs_de_report;
+        cs_de_populate_report(&latest_local_steps, &latest_peer_steps,
+                              BT_CONN_LE_CS_ROLE_INITIATOR, &cs_de_report);
 
-	/* This struct is static to avoid putting it on the stack (it's very large) */
-	static cs_de_report_t cs_de_report;
+        cs_de_quality_t quality = cs_de_calc(&cs_de_report);
+        if (quality == CS_DE_QUALITY_OK) {
+            for (uint8_t ap = 0; ap < cs_de_report.n_ap; ap++) {
+                if (cs_de_report.tone_quality[ap] == CS_DE_TONE_QUALITY_OK) {
+                    store_distance_estimates(&cs_de_report);
+                }
+            }
+        }
+    }
 
-	cs_de_populate_report(&latest_local_steps, &latest_peer_steps, BT_CONN_LE_CS_ROLE_INITIATOR,
-						  &cs_de_report);
-
-	net_buf_simple_reset(&latest_local_steps);
-	net_buf_simple_reset(&latest_peer_steps);
-	k_sem_give(&sem_local_steps);
-
-	cs_de_quality_t quality = cs_de_calc(&cs_de_report);
-
-	if (quality == CS_DE_QUALITY_OK)
-	{
-		for (uint8_t ap = 0; ap < cs_de_report.n_ap; ap++)
-		{
-			if (cs_de_report.tone_quality[ap] == CS_DE_TONE_QUALITY_OK)
-			{
-				store_distance_estimates(&cs_de_report);
-			}
-		}
-	}
+    /* Clean up and allow next procedure */
+    net_buf_simple_reset(&latest_local_steps);
+    net_buf_simple_reset(&latest_peer_steps);
+    active_rc = 0xFFFF;
+    active_rc_local_done = false;
+    active_rc_ready_seen = false;
+    k_sem_give(&sem_local_steps);
 }
 
+
+
+// static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subevent_result *result)
+// {
+// 	if (dropped_ranging_counter == result->header.procedure_counter)
+// 	{
+// 		return;
+// 	}
+
+// 	if (most_recent_local_ranging_counter != bt_ras_rreq_get_ranging_counter(result->header.procedure_counter))
+// 	{
+// 		int sem_state = k_sem_take(&sem_local_steps, K_NO_WAIT);
+
+// 		if (sem_state < 0)
+// 		{
+// 			dropped_ranging_counter = result->header.procedure_counter;
+// 			LOG_DBG("Dropped subevent results due to unfinished ranging data request.");
+// 			return;
+// 		}
+
+// 		most_recent_local_ranging_counter =
+// 			bt_ras_rreq_get_ranging_counter(result->header.procedure_counter);
+// 	}
+
+// 	if (result->header.subevent_done_status == BT_CONN_LE_CS_SUBEVENT_ABORTED)
+// 	{
+// 		/* The steps from this subevent will not be used. */
+// 	}
+// 	else if (result->step_data_buf)
+// 	{
+// 		if (result->step_data_buf->len <= net_buf_simple_tailroom(&latest_local_steps))
+// 		{
+// 			uint16_t len = result->step_data_buf->len;
+// 			uint8_t *step_data = net_buf_simple_pull_mem(result->step_data_buf, len);
+
+// 			net_buf_simple_add_mem(&latest_local_steps, step_data, len);
+// 		}
+// 		else
+// 		{
+// 			LOG_ERR("Not enough memory to store step data. (%d > %d)",
+// 					latest_local_steps.len + result->step_data_buf->len,
+// 					latest_local_steps.size);
+// 			net_buf_simple_reset(&latest_local_steps);
+// 			dropped_ranging_counter = result->header.procedure_counter;
+// 			return;
+// 		}
+// 	}
+
+// 	dropped_ranging_counter = PROCEDURE_COUNTER_NONE;
+
+// 	if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_COMPLETE)
+// 	{
+// 		most_recent_local_ranging_counter =
+// 			bt_ras_rreq_get_ranging_counter(result->header.procedure_counter);
+// 	}
+// 	else if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_ABORTED)
+// 	{
+// 		LOG_WRN("Procedure %u aborted", result->header.procedure_counter);
+// 		net_buf_simple_reset(&latest_local_steps);
+// 		k_sem_give(&sem_local_steps);
+// 	}
+// }
 static void subevent_result_cb(struct bt_conn *conn, struct bt_conn_le_cs_subevent_result *result)
 {
-	if (dropped_ranging_counter == result->header.procedure_counter)
-	{
-		return;
-	}
+    uint16_t rc = bt_ras_rreq_get_ranging_counter(result->header.procedure_counter);
 
-	if (most_recent_local_ranging_counter != bt_ras_rreq_get_ranging_counter(result->header.procedure_counter))
-	{
-		int sem_state = k_sem_take(&sem_local_steps, K_NO_WAIT);
+    if (dropped_ranging_counter == result->header.procedure_counter) {
+        return;
+    }
 
-		if (sem_state < 0)
-		{
-			dropped_ranging_counter = result->header.procedure_counter;
-			LOG_DBG("Dropped subevent results due to unfinished ranging data request.");
-			return;
-		}
+    /* New procedure? Take ownership (binary sem) */
+    if (active_rc != rc) {
+        if (k_sem_take(&sem_local_steps, K_NO_WAIT) < 0) {
+            dropped_ranging_counter = result->header.procedure_counter;
+            LOG_DBG("Dropped subevent results due to unfinished ranging data request.");
+            return;
+        }
+        /* Start a fresh cycle for this rc */
+        active_rc = rc;
+        active_rc_local_done = false;
+        active_rc_ready_seen = false;
+        net_buf_simple_reset(&latest_local_steps);
+        net_buf_simple_reset(&latest_peer_steps);
+    }
 
-		most_recent_local_ranging_counter =
-			bt_ras_rreq_get_ranging_counter(result->header.procedure_counter);
-	}
+    /* Accumulate local step data (unchanged) */
+    if (result->header.subevent_done_status != BT_CONN_LE_CS_SUBEVENT_ABORTED && result->step_data_buf) {
+        if (result->step_data_buf->len <= net_buf_simple_tailroom(&latest_local_steps)) {
+            uint16_t len = result->step_data_buf->len;
+            uint8_t *step_data = net_buf_simple_pull_mem(result->step_data_buf, len);
+            net_buf_simple_add_mem(&latest_local_steps, step_data, len);
+        } else {
+            LOG_ERR("Not enough memory for step data. (%d > %d)",
+                    latest_local_steps.len + result->step_data_buf->len, latest_local_steps.size);
+            net_buf_simple_reset(&latest_local_steps);
+            dropped_ranging_counter = result->header.procedure_counter;
+            return;
+        }
+    }
 
-	if (result->header.subevent_done_status == BT_CONN_LE_CS_SUBEVENT_ABORTED)
-	{
-		/* The steps from this subevent will not be used. */
-	}
-	else if (result->step_data_buf)
-	{
-		if (result->step_data_buf->len <= net_buf_simple_tailroom(&latest_local_steps))
-		{
-			uint16_t len = result->step_data_buf->len;
-			uint8_t *step_data = net_buf_simple_pull_mem(result->step_data_buf, len);
+    dropped_ranging_counter = PROCEDURE_COUNTER_NONE;
 
-			net_buf_simple_add_mem(&latest_local_steps, step_data, len);
-		}
-		else
-		{
-			LOG_ERR("Not enough memory to store step data. (%d > %d)",
-					latest_local_steps.len + result->step_data_buf->len,
-					latest_local_steps.size);
-			net_buf_simple_reset(&latest_local_steps);
-			dropped_ranging_counter = result->header.procedure_counter;
-			return;
-		}
-	}
+    if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_COMPLETE) {
+        active_rc_local_done = true;
 
-	dropped_ranging_counter = PROCEDURE_COUNTER_NONE;
-
-	if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_COMPLETE)
-	{
-		most_recent_local_ranging_counter =
-			bt_ras_rreq_get_ranging_counter(result->header.procedure_counter);
-	}
-	else if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_ABORTED)
-	{
-		LOG_WRN("Procedure %u aborted", result->header.procedure_counter);
-		net_buf_simple_reset(&latest_local_steps);
-		k_sem_give(&sem_local_steps);
-	}
+        /* Only now, if ready for this same rc already fired, do the GET */
+        if (active_rc_ready_seen) {
+            int err = bt_ras_rreq_cp_get_ranging_data(connection, &latest_peer_steps, active_rc,
+                                                       ranging_data_get_complete_cb);
+            if (err) {
+                LOG_WRN("Get ranging data (rc=%u) failed early (err %d) - dropping", active_rc, err);
+                /* Clean drop of this cycle */
+                net_buf_simple_reset(&latest_local_steps);
+                net_buf_simple_reset(&latest_peer_steps);
+                active_rc = 0xFFFF;
+                active_rc_local_done = false;
+                active_rc_ready_seen = false;
+                k_sem_give(&sem_local_steps);
+            }
+        }
+    } else if (result->header.procedure_done_status == BT_CONN_LE_CS_PROCEDURE_ABORTED) {
+        LOG_WRN("Procedure %u aborted", result->header.procedure_counter);
+        net_buf_simple_reset(&latest_local_steps);
+        net_buf_simple_reset(&latest_peer_steps);
+        active_rc = 0xFFFF;
+        active_rc_local_done = false;
+        active_rc_ready_seen = false;
+        k_sem_give(&sem_local_steps);
+    }
 }
+
 
 static uint16_t last_requested_counter = 0xFFFF;
 
+// static void ranging_data_ready_cb(struct bt_conn *conn, uint16_t rc)
+// {
+// 	LOG_DBG("Ranging data ready %u", rc);
+
+// 	if (rc == last_requested_counter)
+// 	{
+// 		return; // already requested this one
+// 	}
+// 	last_requested_counter = rc;
+
+// 	int err = bt_ras_rreq_cp_get_ranging_data(connection, &latest_peer_steps,rc, ranging_data_get_complete_cb);
+// 	if (err)
+// 	{
+// 		LOG_ERR("Get ranging data failed (err %d)", err);
+// 		net_buf_simple_reset(&latest_local_steps);
+// 		net_buf_simple_reset(&latest_peer_steps);
+// 		k_sem_give(&sem_local_steps);
+// 	}
+// }
 static void ranging_data_ready_cb(struct bt_conn *conn, uint16_t rc)
 {
-	LOG_DBG("Ranging data ready %u", rc);
+    LOG_DBG("Ranging data ready %u", rc);
 
-	if (rc == last_requested_counter)
-	{
-		return; // already requested this one
-	}
-	last_requested_counter = rc;
+    /* Ignore if it isn’t the one we own */
+    if (rc != active_rc) {
+        return;
+    }
 
-	int err = bt_ras_rreq_cp_get_ranging_data(connection, &latest_peer_steps,rc, ranging_data_get_complete_cb);
-	if (err)
-	{
-		LOG_ERR("Get ranging data failed (err %d)", err);
-		net_buf_simple_reset(&latest_local_steps);
-		net_buf_simple_reset(&latest_peer_steps);
-		k_sem_give(&sem_local_steps);
-	}
+    active_rc_ready_seen = true;
+
+    if (active_rc_local_done) {
+        int err = bt_ras_rreq_cp_get_ranging_data(connection, &latest_peer_steps, rc,
+                                                   ranging_data_get_complete_cb);
+        if (err) {
+            LOG_WRN("Get ranging data (rc=%u) failed (err %d) - dropping", rc, err);
+            net_buf_simple_reset(&latest_local_steps);
+            net_buf_simple_reset(&latest_peer_steps);
+            active_rc = 0xFFFF;
+            active_rc_local_done = false;
+            active_rc_ready_seen = false;
+            k_sem_give(&sem_local_steps);
+        }
+    }
 }
+
+
+
+// static void ranging_data_overwritten_cb(struct bt_conn *conn, uint16_t ranging_counter)
+// {
+// 	LOG_DBG("Ranging data overwritten %u", ranging_counter);
+// }
 
 static void ranging_data_overwritten_cb(struct bt_conn *conn, uint16_t ranging_counter)
 {
-	LOG_DBG("Ranging data overwritten %u", ranging_counter);
+    LOG_DBG("Ranging data overwritten %u", ranging_counter);
+
+    if (ranging_counter == active_rc) {
+        /* Too late to fetch – drop this cycle */
+        net_buf_simple_reset(&latest_local_steps);
+        net_buf_simple_reset(&latest_peer_steps);
+        active_rc = 0xFFFF;
+        active_rc_local_done = false;
+        active_rc_ready_seen = false;
+        k_sem_give(&sem_local_steps);
+    }
 }
+
 
 static void mtu_exchange_cb(struct bt_conn *conn, uint8_t err,
 							struct bt_gatt_exchange_params *params)
